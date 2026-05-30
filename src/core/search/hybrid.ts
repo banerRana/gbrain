@@ -14,6 +14,13 @@ import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import type { SearchResult, SearchOpts, HybridSearchMeta } from '../types.ts';
 import { embed, embedQuery } from '../embedding.ts';
 import { resolveEmbeddingColumn, isCacheSafe } from './embedding-column.ts';
+import {
+  resolveAdaptiveReturn,
+  applyAdaptiveReturn,
+  adaptiveReturnFromConfig,
+  adaptiveReturnEnabled,
+  type AdaptiveReturnDecision,
+} from './return-policy.ts';
 import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker } from './rerank.ts';
@@ -83,7 +90,12 @@ export function applyBacklinkBoost(
     if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     const count = counts.get(r.slug) ?? 0;
     if (count > 0) {
-      r.score *= (1.0 + BACKLINK_BOOST_COEF * Math.log(1 + count));
+      const factor = 1.0 + BACKLINK_BOOST_COEF * Math.log(1 + count);
+      r.score *= factor;
+      // v0.40.4 attribution stamp (D12=A) — formatter reads this for
+      // --explain output. Stays undefined when count == 0 so the
+      // formatter can render "no boosts applied" honestly.
+      r.backlink_boost = factor;
     }
   }
 }
@@ -158,7 +170,10 @@ export function applySalienceBoost(
     const key = `${r.source_id ?? 'default'}::${r.slug}`;
     const score = scores.get(key);
     if (!score || score <= 0) continue;
-    r.score *= (1.0 + k * Math.log(1 + score));
+    const factor = 1.0 + k * Math.log(1 + score);
+    r.score *= factor;
+    // v0.40.4 attribution stamp (D12=A).
+    r.salience_boost = factor;
   }
 }
 
@@ -208,6 +223,8 @@ export function applyRecencyBoost(
     const recencyComponent = cfg.coefficient * cfg.halflifeDays / (cfg.halflifeDays + daysOld);
     const factor = 1.0 + strengthMul * recencyComponent;
     r.score *= factor;
+    // v0.40.4 attribution stamp (D12=A).
+    r.recency_boost = factor;
   }
 }
 
@@ -241,8 +258,32 @@ export interface PostFusionOpts {
    * (`applyExactMatchBoost`) runs AFTER `runPostFusionStages` and is NOT
    * gated — it's a lexical-relevance signal, different in kind from
    * metadata boosts.
+   *
+   * v0.40.4: scope extended to the new graph_signals stage. Graph
+   * signals are a metadata-axis boost like backlink/salience/recency
+   * — same floor-gate inheritance prevents the weak-page-becomes-hub
+   * regression (codex T2 / D1=A in v0.40.4 plan).
    */
   floorRatio?: number;
+  /**
+   * v0.40.4 — gate for the graph-signals stage (4th post-fusion stage).
+   * False short-circuits to no-op. When true, applyGraphSignals fires
+   * AFTER backlink/salience/recency so it stacks on top of metadata
+   * boosts. Resolved from ModeBundle.graph_signals by the caller.
+   */
+  graphSignalsEnabled?: boolean;
+  /**
+   * v0.40.4 — observability sink for graph-signal fire counts. Threaded
+   * through hybridSearch.onMeta so eval-capture sees per-query metrics.
+   */
+  onGraphMeta?: (meta: import('./graph-signals.ts').GraphSignalsMeta) => void;
+  /**
+   * v0.40.4 — observability sink for score-distribution stats (top-K
+   * min/p25/p50/p75/p95/max + reorder_band_width). Always emitted when
+   * graphSignalsEnabled is true. Feeds T-todo-2 magnitude calibration
+   * wave via search-stats.
+   */
+  onScoreDistribution?: (dist: import('./graph-signals.ts').ScoreDistribution) => void;
 }
 
 export async function runPostFusionStages(
@@ -251,6 +292,16 @@ export async function runPostFusionStages(
   opts: PostFusionOpts,
 ): Promise<void> {
   if (results.length === 0) return;
+
+  // v0.40.4 attribution stamp (D12=A) — capture base_score ONCE at entry,
+  // BEFORE any boost mutates r.score. Without this, --explain can't
+  // reconstruct the pre-boost score. Idempotent: if base_score is
+  // already populated (caller stamped upstream), preserve it.
+  for (const r of results) {
+    if (r.base_score === undefined) {
+      r.base_score = r.score;
+    }
+  }
 
   // v0.35.6.0 [floor-ratio gate]: compute threshold ONCE at entry, BEFORE any
   // boost mutates scores. Single-baseline semantic — the same threshold gates
@@ -305,6 +356,95 @@ export async function runPostFusionStages(
       // Non-fatal.
     }
   }
+
+  // v0.40.4 — graph-signals stage (4th post-fusion stage). Runs AFTER
+  // backlink/salience/recency so it stacks on top of metadata boosts;
+  // shares the same floor-threshold so a weak hub gets the same
+  // protection v0.35.6.0 added for other metadata boosts. Fail-open at
+  // this level matches the per-stage non-fatal contract.
+  if (opts.graphSignalsEnabled) {
+    try {
+      const { applyGraphSignals } = await import('./graph-signals.ts');
+      await applyGraphSignals(results, engine, {
+        enabled: true,
+        floorThreshold,
+        onMeta: opts.onGraphMeta,
+        onScoreDistribution: opts.onScoreDistribution,
+      });
+    } catch {
+      // Non-fatal; preserves the per-stage contract.
+    }
+  }
+
+  // v0.42 (T19, plan D6) — alias_resolved stage (5th post-fusion stage).
+  // Runs LAST so its 1.05x multiplier stacks on top of every other boost.
+  // Fires when the result's slug is a canonical_slug in slug_aliases —
+  // the page is the authoritative version of one or more aliases. Signal
+  // intent: "user explicitly disambiguated this as canonical." Defense-
+  // in-depth: pre-v105 brains don't have slug_aliases table; the lookup
+  // throws isUndefinedTableError and the stage no-ops.
+  try {
+    await applyAliasResolvedBoost(results, engine);
+  } catch {
+    // Non-fatal; preserves the per-stage contract.
+  }
+}
+
+/**
+ * v0.42 (T19) — apply 1.05x boost to results whose slug is a canonical_slug
+ * in slug_aliases. Stamps `alias_resolved_boost` on touched results so
+ * --explain can render the contribution.
+ *
+ * Single index-hit query bounded by top-K (slug_aliases is small relative
+ * to the result set; ALIASES <<< PAGES even on the 186K-page production
+ * brain where 5.5K aliases is ~3% of pages).
+ *
+ * Source-scoped (codex F9: keyed by {source_id, slug} not just slug).
+ */
+const ALIAS_RESOLVED_BOOST = 1.05;
+
+async function applyAliasResolvedBoost(
+  results: SearchResult[],
+  engine: import('../engine.ts').BrainEngine,
+): Promise<void> {
+  if (results.length === 0) return;
+  // Build the (source_id, slug) composite list for the lookup.
+  const refs = Array.from(
+    new Map(
+      results.map(r => [
+        `${r.source_id ?? 'default'}::${r.slug}`,
+        { slug: r.slug, source_id: r.source_id ?? 'default' },
+      ]),
+    ).values(),
+  );
+  if (refs.length === 0) return;
+  // Find which refs are canonical of any slug_aliases row.
+  // Two-array unnest for source-scoped composite lookup.
+  const sourceIds = refs.map(r => r.source_id);
+  const slugs = refs.map(r => r.slug);
+  let rows: Array<{ source_id: string; canonical_slug: string }> = [];
+  try {
+    rows = await engine.executeRaw<{ source_id: string; canonical_slug: string }>(
+      `SELECT DISTINCT source_id, canonical_slug
+       FROM slug_aliases
+       WHERE (source_id, canonical_slug) IN (
+         SELECT * FROM unnest($1::text[], $2::text[])
+       )`,
+      [sourceIds, slugs],
+    );
+  } catch {
+    // Pre-v104 brain or other SQL miss; no-op.
+    return;
+  }
+  if (rows.length === 0) return;
+  const canonicalSet = new Set(rows.map(r => `${r.source_id}::${r.canonical_slug}`));
+  for (const r of results) {
+    const key = `${r.source_id ?? 'default'}::${r.slug}`;
+    if (canonicalSet.has(key)) {
+      r.score *= ALIAS_RESOLVED_BOOST;
+      r.alias_resolved_boost = ALIAS_RESOLVED_BOOST;
+    }
+  }
 }
 
 export interface HybridSearchOpts extends SearchOpts {
@@ -357,6 +497,10 @@ export async function hybridSearch(
       // over per-key config wins over mode bundle (currently undefined for
       // all 3 bundles — pending ablation evidence).
       floor_ratio: opts?.floorRatio,
+      // v0.40.4 — graph_signals thread-through. Per-call wins over config
+      // override wins over mode bundle. Without this thread the eval gate
+      // would be a no-op (both branches resolve to the same mode default).
+      graph_signals: opts?.graph_signals,
     },
   });
 
@@ -508,6 +652,12 @@ export async function hybridSearch(
     // undefined for all 3 bundles → no behavior change unless caller sets
     // SearchOpts.floorRatio or `search.floor_ratio` config key.
     floorRatio: resolvedMode.floor_ratio,
+    // v0.40.4 — graph_signals stage threaded from resolved mode. Defaults
+    // per ModeBundle (conservative=false, balanced/tokenmax=true). Per-call
+    // SearchOpts.graph_signals overrides through resolveSearchMode.
+    // Without this thread, the entire graph-signals wave is dead code —
+    // codex outside-voice caught the missing wire pre-merge.
+    graphSignalsEnabled: resolvedMode.graph_signals,
   };
 
   // Skip vector search entirely if the gateway has no embedding provider configured (Codex C3).
@@ -885,7 +1035,23 @@ export async function hybridSearch(
     ? await applyReranker(query, deduped, rerankerOpts as any)
     : deduped;
 
-  const sliced = reranked.slice(offset, offset + limit);
+  // v0.42 — intent-aware adaptive return-sizing (opt-in, default off). Trim
+  // the ranked candidate set to an intent-driven cap BEFORE the limit slice,
+  // and only on the first page (offset===0) — paginating a confidence-gated
+  // set is incoherent, so paginated calls fall through to the fixed limit.
+  const adaptiveCfg = resolveAdaptiveReturn(
+    opts?.adaptiveReturn,
+    adaptiveReturnFromConfig(cfgForColumn as Record<string, unknown> | null),
+  );
+  let returnPool = reranked;
+  let adaptiveDecision: AdaptiveReturnDecision | undefined;
+  if (adaptiveCfg.enabled && offset === 0) {
+    const r = applyAdaptiveReturn(reranked, suggestions.intent, adaptiveCfg);
+    returnPool = r.kept;
+    adaptiveDecision = r.decision;
+  }
+
+  const sliced = returnPool.slice(offset, offset + limit);
   // v0.32.3 search-lite: budget enforcement at the main return path.
   // hybridSearchCached used to be the only place this fired; now bare
   // hybridSearch enforces it too so eval-replay + eval-longmemeval see
@@ -902,6 +1068,7 @@ export async function hybridSearch(
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
+    ...(adaptiveDecision ? { adaptive_return: adaptiveDecision } : {}),
   });
   return budgeted;
 }
@@ -952,6 +1119,12 @@ export async function hybridSearchCached(
       // Without this, a no-floor write would be served to a floor-enabled
       // read (ranking-correctness leak, codex T1).
       floor_ratio: opts?.floorRatio,
+      // v0.40.4 — graph_signals threaded through cache resolver too so
+      // knobsHash() includes the per-call override (KNOBS_HASH_VERSION=4
+      // folds gs= into the hash). Without this thread, a per-call
+      // override would write to one cache row but read from a different
+      // one on the next call.
+      graph_signals: opts?.graph_signals,
     },
   });
   // v0.36 (D8 / CDX-2 + codex /ship #4): resolve column for the cache
@@ -991,11 +1164,20 @@ export async function hybridSearchCached(
   // a non-default embedding column (per-call or via config default —
   // D8 closes the silent-corruption bug class), or near-symbol mode
   // (structural state that the cache can't safely express).
+  // v0.42 — when adaptive return-sizing is on, skip the cache: a gated
+  // (trimmed) result set must not be served to a gate-off lookup, and vice
+  // versa. Folding the gate params into knobsHash is the v0.42+ follow-up
+  // (TODO) that lets adaptive-on calls cache safely; until then, skip.
+  const adaptiveReturnOn = adaptiveReturnEnabled(
+    opts?.adaptiveReturn,
+    cfgCached as unknown as Record<string, unknown> | null,
+  );
   const skipCache =
     !cache.isEnabled() ||
     (opts?.walkDepth ?? 0) > 0 ||
     Boolean(opts?.nearSymbol) ||
-    isNonDefaultColumn;
+    isNonDefaultColumn ||
+    adaptiveReturnOn;
 
   let cacheStatus: 'hit' | 'miss' | 'disabled' = skipCache ? 'disabled' : 'miss';
   let cacheSimilarity: number | undefined;
